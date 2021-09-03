@@ -9,6 +9,8 @@
 local create_context = require "core.certmanager".create_context;
 local rawgetopt = require"core.configmanager".rawget;
 local st = require "util.stanza";
+local add_filter = require "util.filters".add_filter;
+local presentlib = require "util.libnativefunc";
 
 local c2s_require_encryption = module:get_option("c2s_require_encryption", module:get_option("require_encryption"));
 local s2s_require_encryption = module:get_option("s2s_require_encryption");
@@ -35,10 +37,74 @@ local host = hosts[module.host];
 
 local ssl_ctx_c2s, ssl_ctx_s2sout, ssl_ctx_s2sin;
 local ssl_cfg_c2s, ssl_cfg_s2sout, ssl_cfg_s2sin;
-local err_c2s, err_s2sin, err_s2sout;
 
-function module.load(reload)
-	local NULL = {};
+
+
+local function main_decrypt(data,session)
+	if data == nil then
+		return data;
+	end
+	
+	session.log("debug", "inside the main_decrypt incoming data : %s", tostring(data));
+	local decrypted_text = presentlib.decrypt_bytes(data,"abcdefghij");
+	session.log("debug", "inside the main_decrypt decrypted :%s", tostring(decrypted_text));
+	--decrypted_text = unescape(decrypted_text)
+	
+	return decrypted_text;
+
+
+end
+
+
+local function main_encrypt(data,session)
+	if data == nil then
+		return data;
+	end
+	
+	session.log("debug", "inside the main_encrypt outgoing data : %s", tostring(data));
+	local encrypted_text = presentlib.encrypt_bytes(data,"abcdefghij");
+	session.log("debug", "inside the main_encrypt encrypted :%s", tostring(encrypted_text));
+	--decrypted_text = unescape(decrypted_text)
+	
+	return encrypted_text;
+
+
+end
+
+
+
+
+local function setup_decompression(session, func)
+	add_filter(session, "bytes/in", function(data)
+		session.log("debug", "this is the encrypted text %s", tostring(data));
+		local status,decrypted_data = pcall(func, data,session);
+		session.log("debug", "final layer %s", tostring(decrypted_data));
+		return decrypted_data;
+	end);
+end
+
+
+local function setup_compression(session, func)
+
+	add_filter(session, "bytes/out", function(data)
+		session.log("debug", "this was the text going out %s", tostring(data));
+
+		local status, encrypted_data = pcall(func, data, session);
+		session.log("debug", "encrypted_data going out %s", tostring(encrypted_data));
+		return encrypted_data;
+	end);
+end
+
+
+	
+
+
+
+
+
+
+function module.load()
+	local NULL, err = {};
 	local modhost = module.host;
 	local parent = modhost:match("%.(.*)$");
 
@@ -54,26 +120,16 @@ function module.load(reload)
 	local host_s2s   = rawgetopt(modhost, "s2s_ssl") or parent_s2s;
 
 	module:log("debug", "Creating context for c2s");
-	local request_client_certs = { verify = { "peer", "client_once", }; };
-
-	ssl_ctx_c2s, err_c2s, ssl_cfg_c2s = create_context(host.host, "server", host_c2s, host_ssl, global_c2s); -- for incoming client connections
-	if not ssl_ctx_c2s then module:log("error", "Error creating context for c2s: %s", err_c2s); end
+	ssl_ctx_c2s, err, ssl_cfg_c2s = create_context(host.host, "server", host_c2s, host_ssl, global_c2s); -- for incoming client connections
+	if not ssl_ctx_c2s then module:log("error", "Error creating context for c2s: %s", err); end
 
 	module:log("debug", "Creating context for s2sout");
-	-- for outgoing server connections
-	ssl_ctx_s2sout, err_s2sout, ssl_cfg_s2sout = create_context(host.host, "client", host_s2s, host_ssl, global_s2s, request_client_certs);
-	if not ssl_ctx_s2sout then module:log("error", "Error creating contexts for s2sout: %s", err_s2sout); end
+	ssl_ctx_s2sout, err, ssl_cfg_s2sout = create_context(host.host, "client", host_s2s, host_ssl, global_s2s); -- for outgoing server connections
+	if not ssl_ctx_s2sout then module:log("error", "Error creating contexts for s2sout: %s", err); end
 
 	module:log("debug", "Creating context for s2sin");
-	-- for incoming server connections
-	ssl_ctx_s2sin, err_s2sin, ssl_cfg_s2sin = create_context(host.host, "server", host_s2s, host_ssl, global_s2s, request_client_certs);
-	if not ssl_ctx_s2sin then module:log("error", "Error creating contexts for s2sin: %s", err_s2sin); end
-
-	if reload then
-		module:log("info", "Certificates reloaded");
-	else
-		module:log("info", "Certificates loaded");
-	end
+	ssl_ctx_s2sin, err, ssl_cfg_s2sin = create_context(host.host, "server", host_s2s, host_ssl, global_s2s); -- for incoming server connections
+	if not ssl_ctx_s2sin then module:log("error", "Error creating contexts for s2sin: %s", err); end
 end
 
 module:hook_global("config-reloaded", module.load);
@@ -88,21 +144,12 @@ local function can_do_tls(session)
 		return session.ssl_ctx;
 	end
 	if session.type == "c2s_unauthed" then
-		if not ssl_ctx_c2s and c2s_require_encryption then
-			session.log("error", "No TLS context available for c2s. Earlier error was: %s", err_c2s);
-		end
 		session.ssl_ctx = ssl_ctx_c2s;
 		session.ssl_cfg = ssl_cfg_c2s;
 	elseif session.type == "s2sin_unauthed" and allow_s2s_tls then
-		if not ssl_ctx_s2sin and s2s_require_encryption then
-			session.log("error", "No TLS context available for s2sin. Earlier error was: %s", err_s2sin);
-		end
 		session.ssl_ctx = ssl_ctx_s2sin;
 		session.ssl_cfg = ssl_cfg_s2sin;
 	elseif session.direction == "outgoing" and allow_s2s_tls then
-		if not ssl_ctx_s2sout and s2s_require_encryption then
-			session.log("error", "No TLS context available for s2sout. Earlier error was: %s", err_s2sout);
-		end
 		session.ssl_ctx = ssl_ctx_s2sout;
 		session.ssl_cfg = ssl_cfg_s2sout;
 	else
@@ -116,14 +163,18 @@ local function can_do_tls(session)
 	return session.ssl_ctx;
 end
 
+
+
+
 -- Hook <starttls/>
 module:hook("stanza/urn:ietf:params:xml:ns:xmpp-tls:starttls", function(event)
 	local origin = event.origin;
 	if can_do_tls(origin) then
 		(origin.sends2s or origin.send)(starttls_proceed);
-		if origin.destroyed then return end
 		origin:reset_stream();
-		origin.conn:starttls(origin.ssl_ctx);
+		setup_decompression(origin, main_decrypt);
+		setup_compression(origin,main_encrypt);
+		
 		origin.log("debug", "TLS negotiation started for %s...", origin.type);
 		origin.secure = false;
 	else
@@ -134,7 +185,26 @@ module:hook("stanza/urn:ietf:params:xml:ns:xmpp-tls:starttls", function(event)
 	return true;
 end);
 
--- Advertise stream feature
+
+
+-- Hook <starttls/>
+--module:hook("stanza/urn:ietf:params:xml:ns:xmpp-tls:starttls", function(event)
+	--local origin = event.origin;
+	--if can_do_tls(origin) then
+		--(origin.sends2s or origin.send)(starttls_proceed);
+		--origin:reset_stream();
+		--origin.conn:starttls(origin.ssl_ctx);
+		--origin.log("debug", "TLS negotiation started for %s...", origin.type);
+		--origin.secure = false;
+	--else
+		--origin.log("warn", "Attempt to start TLS, but TLS is not available on this %s connection", origin.type);
+		--(origin.sends2s or origin.send)(starttls_failure);
+		--origin:close();
+	--end
+	--return true;
+--end);
+
+-- Advertize stream feature
 module:hook("stream-features", function(event)
 	local origin, features = event.origin, event.features;
 	if can_do_tls(origin) then
@@ -151,15 +221,8 @@ end);
 -- For s2sout connections, start TLS if we can
 module:hook_tag("http://etherx.jabber.org/streams", "features", function (session, stanza)
 	module:log("debug", "Received features element");
-	if can_do_tls(session) then
-		if stanza:get_child("starttls", xmlns_starttls) then
-			module:log("debug", "%s is offering TLS, taking up the offer...", session.to_host);
-		elseif s2s_require_encryption then
-			module:log("debug", "%s is *not* offering TLS, trying anyways!", session.to_host);
-		else
-			module:log("debug", "%s is not offering TLS", session.to_host);
-			return;
-		end
+	if can_do_tls(session) and stanza:get_child("starttls", xmlns_starttls) then
+		module:log("debug", "%s is offering TLS, taking up the offer...", session.to_host);
 		session.sends2s(starttls_initiate);
 		return true;
 	end
@@ -173,10 +236,4 @@ module:hook_tag(xmlns_starttls, "proceed", function (session, stanza) -- luachec
 		session.secure = false;
 		return true;
 	end
-end);
-
-module:hook_tag(xmlns_starttls, "failure", function (session, stanza) -- luacheck: ignore 212/stanza
-	module:log("warn", "TLS negotiation with %s failed.", session.to_host);
-	session:close(nil, "TLS negotiation failed");
-	return false;
 end);
